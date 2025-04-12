@@ -6,161 +6,240 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.Set;
+import java.util.Map;
 
 /**
  * ProtocolLayer handles:
- *  - MAC (waiting for FREE, random backoff)
- *  - Fragmentation & Reliability (ACKs)
- *  - Multi-Hop (basic flooding or direct neighbor unicast)
- *  - Neighbor Discovery
+ *   - Dynamic Addressing (if localAddress==0)
+ *   - MAC (naive random backoff)
+ *   - Stop-and-Wait reliability (ACKs)
+ *   - Basic multi-hop broadcast
+ *   - Neighbor discovery
  */
 public class ProtocolLayer {
 
-    // Constants
-    private static final int MAX_DATA_LEN = 32;      // Per the emulator spec
-    private static final int HEADER_LEN   = 6;       // Example: 6 bytes of custom header
-    private static final byte BROADCAST_ADDR = (byte)0xFF; // A special "broadcast" address
+    // ========== Constants ==========
 
-    // Fields
-    private byte localAddress;                       // This node's address (0-255, for example)
-    private BlockingQueue<Message> recvQueue;        // Filled by the Client.Listener
-    private BlockingQueue<Message> sendQueue;        // Consumed by the Client.Sender
+    public static final byte BROADCAST_ADDR = (byte) 0xFF;
 
-    // We store a queue of messages we want to transmit. Our "MAC" logic will read from this.
+    // Byte-level frames from the emulator: 32 max
+    private static final int MAX_DATA_LEN = 32;
+    // We'll store a 7-byte (or more) header for normal data/ACK:
+    private static final int HEADER_LEN = 7;
+
+    // Control flags (previous + new)
+    private static final byte FLAG_DATA        = 0x00;
+    private static final byte FLAG_HELLO       = 0x01;
+    private static final byte FLAG_ACK         = 0x02;
+    private static final byte FLAG_ADDR_CLAIM  = 0x03; // new
+    private static final byte FLAG_ADDR_CONFLICT = 0x04; // new
+
+    // If we haven't assigned an address, we set isAddressAssigned = false.
+    // Then we do dynamic addressing.
+    private volatile boolean isAddressAssigned = false;
+
+    // ========== Fields ==========
+
+    private volatile byte localAddress;
+    private BlockingQueue<Message> recvQueue; // from Client.Listener
+    private BlockingQueue<Message> sendQueue; // to Client.Sender
+
+    // The MAC queue
     private BlockingQueue<ByteBuffer> macTxQueue = new LinkedBlockingQueue<>();
 
-    // Keep track of the channel state from BUSY/FREE messages
+    // Channel busy/free
     private volatile boolean channelBusy = false;
 
-    // Store neighbors
-    // Maps neighbor address -> time last heard
+    // Neighbors: neighborAddr -> lastHeardTime
     private ConcurrentHashMap<Byte, Long> neighbors = new ConcurrentHashMap<>();
-    private static final long NEIGHBOR_TIMEOUT_MS = 30_000; // e.g. 30s
+    private static final long NEIGHBOR_TIMEOUT_MS = 30000; // 30s
 
-    // Store partial message fragments for reassembly
-    // Key: (srcAddr, messageID) => a reassembly buffer
+    // Reassembly storage
     private Map<String, MessageFragmentBuffer> reassemblyMap = new ConcurrentHashMap<>();
-
-    // Store known (srcAddr,messageID,fragmentIndex) to avoid reflooding duplicates
     private Set<String> seenFragmentIds = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-    // A callback to deliver fully reassembled messages up to MyProtocol
+    // For delivering messages to MyProtocol
     public interface ProtocolCallback {
         void onReceivedChatMessage(String fromAddr, String message);
         void onNeighborsChanged(Set<Byte> currentNeighbors);
     }
     private ProtocolCallback callback;
 
-    // For reliability: store pending acks, sequence numbers, etc. (optional advanced)
-    // For brevity, we'll keep it simple in this example.
+    // ACK manager for Stop-and-Wait
+    private AckManager ackManager = new AckManager();
 
-    /**
-     * Constructor
-     * @param localAddress a unique ID for this node (0-255).
-     * @param recvQueue queue from Client (incoming)
-     * @param sendQueue queue to Client (outgoing)
-     * @param callback to notify MyProtocol about incoming messages or neighbor changes
-     */
-    public ProtocolLayer(byte localAddress,
+    // For dynamic addressing
+    private final Object addrLock = new Object();
+    private static final int ADDR_ASSIGN_TIMEOUT_MS = 3000; // Grace period to detect conflicts
+
+    public ProtocolLayer(byte initialAddress,
                          BlockingQueue<Message> recvQueue,
                          BlockingQueue<Message> sendQueue,
                          ProtocolCallback callback)
     {
-        this.localAddress = localAddress;
+        this.localAddress = initialAddress;
         this.recvQueue = recvQueue;
         this.sendQueue = sendQueue;
         this.callback = callback;
-    }
 
-    // =========================  Public Methods  =========================
-
-    /**
-     * Start the threads that handle receiving and MAC transmissions.
-     */
-    public void start() {
-        // Thread for processing incoming frames
-        new Thread(this::receiveLoop, "Protocol-ReceiveLoop").start();
-
-        // Thread for handling MAC transmissions
-        new Thread(this::macLoop, "Protocol-MacLoop").start();
-
-        // Thread for periodic neighbor discovery "HELLO"
-        new Thread(() -> {
-            try {
-                while(true) {
-                    sendHello();
-                    cleanupOldNeighbors();
-                    Thread.sleep(5000);
-                }
-            } catch (InterruptedException e) {
-                // Exit thread
-            }
-        }, "Protocol-HelloThread").start();
-    }
-
-    /**
-     * Send a chat message to either a specific node or broadcast if destAddr == BROADCAST_ADDR.
-     */
-    public void sendChatMessage(String message, byte destAddr) {
-        // Fragment if needed
-        byte[] dataBytes = message.getBytes(StandardCharsets.UTF_8);
-        // For simplicity, let's generate a random messageID:
-        short messageID = (short)new Random().nextInt(Short.MAX_VALUE);
-
-        // Break into 32-byte fragments (minus HEADER_LEN)
-        int maxPayloadSize = MAX_DATA_LEN - HEADER_LEN;
-        int totalFragments = (int)Math.ceil(dataBytes.length / (double)maxPayloadSize);
-
-        int offset = 0;
-        for (int fragIdx = 0; fragIdx < totalFragments; fragIdx++) {
-            int len = Math.min(maxPayloadSize, dataBytes.length - offset);
-            byte[] fragmentPayload = Arrays.copyOfRange(dataBytes, offset, offset + len);
-            offset += len;
-
-            // Build a ByteBuffer with the header + payload
-            ByteBuffer frame = buildFrameHeader(
-                    (byte)0x00, // controlFlags - (0x00 for normal data)
-                    localAddress,
-                    destAddr,
-                    messageID,
-                    (byte)fragIdx,
-                    (byte)totalFragments
-            );
-            frame.put(fragmentPayload);
-            frame.flip();
-
-            // Put it into the macTxQueue, which will eventually go to the sendQueue
-            macTxQueue.offer(frame);
+        // If initialAddress != 0, we consider that assigned (static). Otherwise, dynamic.
+        if (this.localAddress != 0) {
+            isAddressAssigned = true;
         }
     }
 
+    // ========== Lifecycle ==========
+
+    public void start() {
+        // 1) Start the thread that processes incoming frames
+        new Thread(this::receiveLoop, "Protocol-ReceiveLoop").start();
+
+        // 2) Start the MAC loop
+        new Thread(this::macLoop, "Protocol-MacLoop").start();
+
+        // 3) Possibly do dynamic addressing if localAddress == 0
+        if (!isAddressAssigned) {
+            new Thread(this::addressAssignmentLoop, "AddressAssignmentLoop").start();
+        }
+
+        // 4) Once we have an address, do normal HELLO
+        new Thread(this::helloLoop, "Protocol-HelloLoop").start();
+    }
+
     /**
-     * Get the current set of neighbor addresses
+     * For the application: get our final local address (once assigned).
+     */
+    public byte getLocalAddress() {
+        return localAddress;
+    }
+
+    // ========== Public Chat API ==========
+
+    /**
+     * Send a user message (fragmented + Stop-and-Wait ACK)
+     */
+    public void sendChatMessage(String message, byte destAddr) {
+        // If not assigned yet, we might want to block or reject. For a simple approach:
+        if (!isAddressAssigned) {
+            System.out.println("Address not assigned yet. Cannot send chat message.");
+            return;
+        }
+
+        new Thread(() -> {
+            try {
+                stopAndWaitSend(message, destAddr);
+            } catch (InterruptedException e) {
+                System.err.println("sendChatMessage interrupted: " + e);
+            }
+        }, "StopAndWaitSender").start();
+    }
+
+    /**
+     * Returns an unmodifiable set of known neighbors
      */
     public Set<Byte> getNeighbors() {
         return Collections.unmodifiableSet(neighbors.keySet());
     }
 
-    // =========================  Private Methods  =========================
+    // ========== Private Methods ==========
 
     /**
-     * The main receiving loop. Continuously takes Messages from recvQueue,
-     * parses them, and handles accordingly.
+     * If localAddress == 0, we repeatedly pick a random address, broadcast an ADDR_CLAIM,
+     * wait to see if we get an ADDR_CONFLICT. If none, we finalize. If conflict, pick again.
+     */
+    private void addressAssignmentLoop() {
+        Random rand = new Random();
+        while (!isAddressAssigned) {
+            // 1) pick a random address in [1..200], for instance
+            byte candidate = (byte) (1 + rand.nextInt(200));
+
+            // 2) broadcast ADDR_CLAIM with that candidate
+            System.out.println("Attempting to claim address: " + candidate);
+            broadcastAddressClaim(candidate);
+
+            // 3) Wait ADDR_ASSIGN_TIMEOUT_MS for conflicts
+            boolean conflict = false;
+            long startTime = System.currentTimeMillis();
+            while (System.currentTimeMillis() - startTime < ADDR_ASSIGN_TIMEOUT_MS) {
+                // We'll sleep small intervals and check for conflicts
+                if (localAddress != 0) {
+                    // Means we somehow got assigned in the meantime
+                    break;
+                }
+                synchronized (addrLock) {
+                    // Did we mark a conflict? We'll see below
+                    if (localConflictCandidate == candidate) {
+                        conflict = true;
+                        break;
+                    }
+                }
+                try {
+                    Thread.sleep(100);
+                } catch (InterruptedException e) {
+                    return; // stop
+                }
+            }
+
+            if (!conflict) {
+                // We assume success
+                synchronized (addrLock) {
+                    if (!hasConflict) {
+                        localAddress = candidate;
+                        isAddressAssigned = true;
+                        System.out.println("Successfully assigned address: " + localAddress);
+                    } else {
+                        // If we discovered conflict after all
+                        System.out.println("Conflict found, retrying...");
+                        hasConflict = false;
+                        localConflictCandidate = 0;
+                    }
+                }
+            } else {
+                // conflict = true
+                synchronized (addrLock) {
+                    System.out.println("Conflict detected for address: " + candidate + ". Retrying...");
+                    hasConflict = false;
+                    localConflictCandidate = 0;
+                }
+            }
+        }
+    }
+
+    // We'll store some simple conflict signals here
+    private boolean hasConflict = false;
+    private byte localConflictCandidate = 0;
+
+    private void broadcastAddressClaim(byte candidate) {
+        ByteBuffer buf = buildFrameHeader(
+                FLAG_ADDR_CLAIM,
+                (byte)0, // 0 means "unassigned" from me
+                BROADCAST_ADDR,
+                (short) 0,  // messageID
+                (byte) 0,   // fragIdx
+                (byte) 1    // totalFrags
+        );
+        // We'll put 1 byte of "candidate" in the payload
+        buf.put(candidate);
+        buf.flip();
+        macTxQueue.offer(buf);
+    }
+
+    /**
+     * The main receiving loop
      */
     private void receiveLoop() {
-        while(true) {
+        while (true) {
             try {
                 Message msg = recvQueue.take();
                 switch (msg.getType()) {
                     case BUSY:
                         channelBusy = true;
-                        // System.out.println("MAC -> Channel is BUSY");
                         break;
                     case FREE:
                         channelBusy = false;
-                        // System.out.println("MAC -> Channel is FREE");
                         break;
                     case DATA:
                     case DATA_SHORT:
@@ -168,159 +247,329 @@ public class ProtocolLayer {
                         break;
                     case SENDING:
                     case DONE_SENDING:
-                        // Possibly track transmissions
+                        // Could track progress if desired
                         break;
-                    case HELLO:
-                    case END:
-                    case TOKEN_ACCEPTED:
-                    case TOKEN_REJECTED:
                     default:
-                        // Handle if needed
+                        // token accepted, token rejected, etc.
                         break;
                 }
             } catch (InterruptedException e) {
-                System.err.println("ProtocolLayer.receiveLoop interrupted.");
+                System.err.println("receiveLoop interrupted: " + e);
                 return;
             }
         }
     }
 
     /**
-     * Parse the incoming ByteBuffer as our custom header + payload
+     * Parse incoming frames and handle them
      */
     private void handleIncomingData(ByteBuffer buf) {
         buf.rewind();
         byte[] raw = new byte[buf.remaining()];
         buf.get(raw);
 
-        // If too short, ignore
         if (raw.length < HEADER_LEN) {
-            System.out.println("Received frame too small, ignoring.");
+            // too short
             return;
         }
 
-        // Parse header (6 bytes in this example)
         byte controlFlags   = raw[0];
         byte srcAddr        = raw[1];
         byte dstAddr        = raw[2];
-        short messageID     = (short)(( (raw[3] & 0xFF) << 8 ) | (raw[4] & 0xFF));
+        short messageID     = (short) (((raw[3] & 0xFF) << 8) | (raw[4] & 0xFF));
         byte fragmentIndex  = raw[5];
+        byte totalFrags     = raw[6];
 
-        // If there's a totalFragments byte, we can read it – but let's assume we used 6 bytes for now.
-        // If you want 7 bytes for header, you'd parse raw[6] as totalFragments, etc.
-        // For demonstration, let's say totalFragments is actually raw[6].
-        // So let's adjust our HEADER_LEN to 7. But I'll keep it 6 to keep it short.
-        // We'll assume totalFragments = fragmentIndex + 1 for the sake of demonstration:
-        byte totalFragments = (byte)(fragmentIndex + 1);
-
-        // Extract payload
         int payloadLen = raw.length - HEADER_LEN;
         byte[] payload = new byte[payloadLen];
         System.arraycopy(raw, HEADER_LEN, payload, 0, payloadLen);
 
-        // If it's a "HELLO" (you could store that in controlFlags, or check a special bit)
-        if (controlFlags == (byte)0x01) {
-            // It's a HELLO
+        // If srcAddr != 0, that means the sender has an assigned address. Update neighbor info
+        if (srcAddr != 0) {
             updateNeighbor(srcAddr);
-            return;
         }
 
-        // For normal data frames, do multi-hop logic if necessary
-        updateNeighbor(srcAddr);  // any frame indicates neighbor is alive
+        // Dispatch by controlFlags
+        switch (controlFlags) {
+            case FLAG_HELLO:
+                // we do nothing else, neighbor updated
+                return;
 
-        // Build a unique fragment key to detect duplicates
-        String fragmentKey = srcAddr + ":" + messageID + ":" + fragmentIndex;
+            case FLAG_ACK:
+                // It's an ACK for some data fragment
+                String ackKey = ackManager.makeAckKey(dstAddr, messageID, fragmentIndex);
+                ackManager.notifyAck(ackKey);
+                return;
 
-        // If we've seen this fragment before, ignore (don't reflood it)
-        if (seenFragmentIds.contains(fragmentKey)) {
-            return;
+            case FLAG_ADDR_CLAIM:
+                handleAddrClaim(srcAddr, payload);
+                return;
+
+            case FLAG_ADDR_CONFLICT:
+                handleAddrConflict(payload);
+                return;
+
+            default:
+                // It's normal data or something else
+                handleNormalData(controlFlags, srcAddr, dstAddr, messageID, fragmentIndex, totalFrags, payload);
+                break;
         }
-        seenFragmentIds.add(fragmentKey);
-
-        // If broadcast & not final destination, we might forward, etc.
-        if (dstAddr == BROADCAST_ADDR && srcAddr != localAddress) {
-            // Flood broadcast to neighbors (except we do not forward if we are the source).
-            forwardBroadcast(controlFlags, srcAddr, dstAddr, messageID, fragmentIndex, payload);
-        }
-
-        // If this frame is destined for me, or if it is broadcast, we reassemble
-        if (dstAddr == localAddress || dstAddr == BROADCAST_ADDR) {
-            reassembleAndDeliver(srcAddr, messageID, fragmentIndex, totalFragments, payload);
-        }
-    }
-
-    private void forwardBroadcast(byte controlFlags, byte srcAddr, byte dstAddr,
-                                  short messageID, byte fragmentIndex, byte[] payload)
-    {
-        // Rebuild the frame
-        ByteBuffer forwardFrame = buildFrameHeader(
-                controlFlags, srcAddr, dstAddr, messageID, fragmentIndex, (byte)(fragmentIndex+1)
-        );
-        forwardFrame.put(payload);
-        forwardFrame.flip();
-        // Put it into the macTxQueue
-        macTxQueue.offer(forwardFrame);
     }
 
     /**
-     * Reassemble the fragments, and when complete, deliver to the application callback.
+     * Handle receiving an address claim from an unassigned node.
+     * "payload[0]" is the candidate address they want.
      */
-    private void reassembleAndDeliver(byte srcAddr, short messageID,
-                                      byte fragIdx, byte totalFrags, byte[] payload)
-    {
-        String mapKey = srcAddr + ":" + messageID;
-        MessageFragmentBuffer buffer = reassemblyMap.get(mapKey);
-        if (buffer == null) {
-            buffer = new MessageFragmentBuffer(totalFrags);
-            reassemblyMap.put(mapKey, buffer);
-        }
+    private void handleAddrClaim(byte srcAddr, byte[] payload) {
+        if (payload.length < 1) return;
+        byte claimed = payload[0];
 
-        buffer.addFragment(fragIdx, payload);
-
-        if (buffer.isComplete()) {
-            // Reassemble
-            byte[] fullMsgBytes = buffer.reassemble();
-            // Convert to string
-            String msgText = new String(fullMsgBytes, StandardCharsets.UTF_8);
-            // Deliver up
-            if (callback != null) {
-                callback.onReceivedChatMessage("Node " + srcAddr, msgText);
+        // If we are using that address ourselves, or we have a known neighbor using that address, conflict.
+        if (isAddressAssigned && localAddress == claimed) {
+            // We broadcast conflict
+            broadcastAddressConflict(claimed);
+        } else {
+            // Check neighbors
+            for (Byte n : neighbors.keySet()) {
+                if (n == claimed) {
+                    broadcastAddressConflict(claimed);
+                    break;
+                }
             }
-            // Remove from map
-            reassemblyMap.remove(mapKey);
         }
     }
 
     /**
-     * Adds the local node's 'HELLO' frames to the macTxQueue for neighbor discovery.
+     * Broadcast address conflict for a specific address
      */
-    private void sendHello() {
-        ByteBuffer frame = buildFrameHeader(
-                (byte)0x01, // controlFlags 0x01 = HELLO
+    private void broadcastAddressConflict(byte claimed) {
+        ByteBuffer buf = buildFrameHeader(
+                FLAG_ADDR_CONFLICT,
                 localAddress,
                 BROADCAST_ADDR,
-                (short)0,  // messageID = 0 for HELLO
-                (byte)0,   // fragmentIndex
-                (byte)1    // totalFragments
+                (short)0, (byte)0, (byte)1
         );
+        buf.put(claimed);
+        buf.flip();
+        macTxQueue.offer(buf);
+    }
+
+    /**
+     * If we are in the middle of claiming an address, seeing a conflict sets a flag.
+     */
+    private void handleAddrConflict(byte[] payload) {
+        if (payload.length < 1) return;
+        byte claimed = payload[0];
+
+        // If we are not assigned yet, and we're attempting that address => conflict
+        if (!isAddressAssigned) {
+            synchronized (addrLock) {
+                localConflictCandidate = claimed;
+                hasConflict = true;
+            }
+        }
+    }
+
+    private void handleNormalData(byte controlFlags, byte srcAddr, byte dstAddr,
+                                  short messageID, byte fragIndex, byte totalFrags,
+                                  byte[] payload)
+    {
+        // Flood / duplication check
+        String fragKey = srcAddr + ":" + messageID + ":" + fragIndex;
+        if (seenFragmentIds.contains(fragKey)) {
+            return;
+        }
+        seenFragmentIds.add(fragKey);
+
+        // Basic broadcast forward
+        if (dstAddr == BROADCAST_ADDR && srcAddr != localAddress) {
+            forwardBroadcast(controlFlags, srcAddr, dstAddr, messageID, fragIndex, totalFrags, payload);
+        }
+
+        // If we are the final dest or broadcast, reassemble & deliver
+        if (dstAddr == localAddress || dstAddr == BROADCAST_ADDR) {
+            reassembleAndDeliver(srcAddr, messageID, fragIndex, totalFrags, payload);
+            // send an ACK
+            if (controlFlags == FLAG_DATA) {
+                sendAckTo(srcAddr, messageID, fragIndex);
+            }
+        }
+    }
+
+    /**
+     * Forward broadcast frames
+     */
+    private void forwardBroadcast(byte controlFlags, byte srcAddr, byte dstAddr,
+                                  short msgID, byte fragIdx, byte totalFrags, byte[] payload)
+    {
+        ByteBuffer frame = buildFrameHeader(controlFlags, srcAddr, dstAddr, msgID, fragIdx, totalFrags);
+        frame.put(payload);
         frame.flip();
         macTxQueue.offer(frame);
     }
 
     /**
-     * Update neighbor table upon receiving any frame from them.
+     * Reassemble + deliver
      */
+    private void reassembleAndDeliver(byte srcAddr, short messageID,
+                                      byte fragIndex, byte totalFrags, byte[] payload)
+    {
+        String mapKey = srcAddr + ":" + messageID;
+        MessageFragmentBuffer buf = reassemblyMap.get(mapKey);
+        if (buf == null) {
+            buf = new MessageFragmentBuffer(totalFrags);
+            reassemblyMap.put(mapKey, buf);
+        }
+
+        buf.addFragment(fragIndex, payload);
+        if (buf.isComplete()) {
+            byte[] fullData = buf.reassemble();
+            String msgText = new String(fullData, StandardCharsets.UTF_8);
+            if (callback != null) {
+                callback.onReceivedChatMessage("Node " + srcAddr, msgText);
+            }
+            reassemblyMap.remove(mapKey);
+        }
+    }
+
+    /**
+     * Send a data fragment with Stop-and-Wait reliability
+     */
+    private void stopAndWaitSend(String message, byte destAddr) throws InterruptedException {
+        byte[] dataBytes = message.getBytes(StandardCharsets.UTF_8);
+        short msgID = (short) new Random().nextInt(Short.MAX_VALUE);
+
+        int maxPayload = MAX_DATA_LEN - HEADER_LEN;
+        int totalFrags = (int) Math.ceil(dataBytes.length / (double) maxPayload);
+        int offset = 0;
+
+        final int MAX_RETRIES = 5;
+        for (int fragIdx = 0; fragIdx < totalFrags; fragIdx++) {
+            int length = Math.min(maxPayload, dataBytes.length - offset);
+            byte[] fragment = Arrays.copyOfRange(dataBytes, offset, offset + length);
+            offset += length;
+
+            ByteBuffer frame = buildFrameHeader(FLAG_DATA, localAddress, destAddr, msgID,
+                                                (byte)fragIdx, (byte)totalFrags);
+            frame.put(fragment);
+            frame.flip();
+
+            // ack key
+            String ackKey = ackManager.makeAckKey(localAddress, msgID, (byte)fragIdx);
+
+            boolean acked = false;
+            int attempts = 0;
+            while (!acked && attempts < MAX_RETRIES) {
+                attempts++;
+                macTxQueue.offer(frame.duplicate());
+                acked = ackManager.waitForAck(ackKey, 2000); // 2s
+                if (!acked) {
+                    System.out.println("No ACK for frag " + fragIdx + ", attempt " + attempts);
+                }
+            }
+            if (!acked) {
+                System.out.println("Stop-and-Wait: giving up after " + MAX_RETRIES + " attempts.");
+                return; // stop sending further fragments
+            }
+        }
+    }
+
+    /**
+     * Send an ACK
+     */
+    private void sendAckTo(byte destAddr, short messageID, byte fragIndex) {
+        ByteBuffer ackFrame = buildFrameHeader(
+                FLAG_ACK,
+                localAddress,
+                destAddr,
+                messageID,
+                fragIndex,
+                (byte)1  // totalFrags=1 for an ACK
+        );
+        ackFrame.flip();
+        macTxQueue.offer(ackFrame);
+    }
+
+    /**
+     * Build a frame with the 7-byte header
+     */
+    private ByteBuffer buildFrameHeader(byte controlFlags, byte srcAddr, byte dstAddr,
+                                        short messageID, byte fragmentIndex, byte totalFrags)
+    {
+        ByteBuffer buf = ByteBuffer.allocate(MAX_DATA_LEN);
+        buf.put(controlFlags);
+        buf.put(srcAddr);
+        buf.put(dstAddr);
+        buf.putShort(messageID);
+        buf.put(fragmentIndex);
+        buf.put(totalFrags);
+        return buf;
+    }
+
+    /**
+     * MAC loop: wait for free, random backoff, etc.
+     */
+    private void macLoop() {
+        Random rand = new Random();
+        while (true) {
+            try {
+                ByteBuffer frame = macTxQueue.take();
+
+                while (channelBusy) {
+                    Thread.sleep(10);
+                }
+                // small random backoff
+                Thread.sleep(10 + rand.nextInt(20));
+
+                if (channelBusy) {
+                    macTxQueue.offer(frame);
+                    continue;
+                }
+
+                sendQueue.put(new Message(MessageType.DATA, frame));
+            } catch (InterruptedException e) {
+                System.err.println("macLoop interrupted: " + e);
+                return;
+            }
+        }
+    }
+
+    /**
+     * Periodic Hello + neighbor cleanup
+     * But we only do HELLO if we have an assigned address
+     */
+    private void helloLoop() {
+        try {
+            while (true) {
+                if (isAddressAssigned) {
+                    sendHello();
+                }
+                cleanupOldNeighbors();
+                Thread.sleep(5000);
+            }
+        } catch (InterruptedException e) {
+            // end
+        }
+    }
+
+    private void sendHello() {
+        ByteBuffer buf = buildFrameHeader(
+                FLAG_HELLO,
+                localAddress,
+                BROADCAST_ADDR,
+                (short)0, (byte)0, (byte)1
+        );
+        buf.flip();
+        macTxQueue.offer(buf);
+    }
+
     private void updateNeighbor(byte neighborAddr) {
         neighbors.put(neighborAddr, System.currentTimeMillis());
-        // Optional: notify callback about new set of neighbors
         if (callback != null) {
             callback.onNeighborsChanged(neighbors.keySet());
         }
     }
 
-    /**
-     * Remove stale neighbors
-     */
     private void cleanupOldNeighbors() {
         long now = System.currentTimeMillis();
         boolean changed = false;
@@ -333,64 +582,5 @@ public class ProtocolLayer {
         if (changed && callback != null) {
             callback.onNeighborsChanged(neighbors.keySet());
         }
-    }
-
-    /**
-     * The MAC loop. We take frames from `macTxQueue`, then wait for the channel to be FREE,
-     * do a random backoff, and then place the frame on `sendQueue`.
-     */
-    private void macLoop() {
-        Random rand = new Random();
-        while(true) {
-            try {
-                ByteBuffer frame = macTxQueue.take();
-                // Wait until channel is free
-                while(channelBusy) {
-                    Thread.sleep(10);
-                }
-                // Random short backoff
-                Thread.sleep(10 + rand.nextInt(10)); // simplistic
-
-                // Check if still free
-                if (channelBusy) {
-                    // Put it back and wait
-                    macTxQueue.offer(frame);
-                    continue;
-                }
-
-                // Send
-                sendQueue.put(new Message(MessageType.DATA, frame));
-
-            } catch (InterruptedException e) {
-                System.err.println("MAC loop interrupted.");
-                return;
-            }
-        }
-    }
-
-    /**
-     * Utility for building a header: 6 bytes in this example:
-     *  [0] controlFlags
-     *  [1] srcAddr
-     *  [2] dstAddr
-     *  [3] messageID high
-     *  [4] messageID low
-     *  [5] fragmentIndex
-     *  (Optionally [6] totalFragments if you want 7 bytes)
-     */
-    private ByteBuffer buildFrameHeader(byte controlFlags, byte srcAddr, byte dstAddr,
-                                        short messageID, byte fragmentIdx, byte totalFrags)
-    {
-        ByteBuffer buf = ByteBuffer.allocate(MAX_DATA_LEN);
-        buf.put(controlFlags);
-        buf.put(srcAddr);
-        buf.put(dstAddr);
-        buf.putShort(messageID);   // 2 bytes
-        buf.put(fragmentIdx);
-        // We’re skipping totalFrags if we keep HEADER_LEN=6
-        // If you want totalFrags, expand HEADER_LEN to 7 and store it as well:
-        // buf.put(totalFrags);
-
-        return buf;
     }
 }

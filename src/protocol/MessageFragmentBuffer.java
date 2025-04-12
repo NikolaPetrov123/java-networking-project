@@ -1,8 +1,11 @@
 package protocol;
 
-import java.util.Arrays;
-
+/**
+ * Utility to hold multiple fragments for a single message.
+ * Once all fragments arrive, we can reassemble into the full payload.
+ */
 public class MessageFragmentBuffer {
+
     private byte[][] fragments;
     private boolean[] received;
     private int totalFrags;

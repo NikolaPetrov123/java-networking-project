@@ -1,14 +1,13 @@
 import client.*;
-import java.nio.ByteBuffer;
-import java.io.IOException;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.LinkedBlockingQueue;
 import java.util.Scanner;
 import java.util.Set;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.LinkedBlockingQueue;
 import protocol.ProtocolLayer;
 
 /**
- * Refactored MyProtocol focusing on application-level logic.
+ * MyProtocol focusing on application-level logic.
+ * Now it supports the possibility of dynamic addressing by passing "0" as localAddress.
  */
 public class MyProtocol {
 
@@ -17,27 +16,28 @@ public class MyProtocol {
     private static int frequency = 2720;
     private static String token = "java-22-B35DAB54DF6BBA640D";
 
-    // Example: store local address as a byte, e.g. 0x01, 0x02, etc.
-    // In real usage, parse from args
-    private static byte localAddress = 0x01;
+    // If this is 0, ProtocolLayer will do dynamic addressing
+    private static byte localAddress = 0x00;
 
     public static void main(String[] args) {
-        // parse arguments if needed
+        // For example:
+        //   args[0] = frequency
+        //   args[1] = localAddress (if 0 => dynamic)
         if (args.length > 0) {
             frequency = Integer.parseInt(args[0]);
         }
         if (args.length > 1) {
-            localAddress = (byte)Integer.parseInt(args[1]);
+            localAddress = (byte) Integer.parseInt(args[1]);
         }
 
-        // Setup queues
+        // Queues for messages from/to Client
         BlockingQueue<Message> receivedQueue = new LinkedBlockingQueue<>();
         BlockingQueue<Message> sendingQueue = new LinkedBlockingQueue<>();
 
-        // Create the underlying client (physical connection)
+        // Create the underlying client (connect to emulator)
         new Client(SERVER_IP, SERVER_PORT, frequency, token, receivedQueue, sendingQueue);
 
-        // Create the ProtocolLayer
+        // Create ProtocolLayer
         ProtocolLayer layer = new ProtocolLayer(
                 localAddress,
                 receivedQueue,
@@ -45,20 +45,21 @@ public class MyProtocol {
                 new ProtocolLayer.ProtocolCallback() {
                     @Override
                     public void onReceivedChatMessage(String fromAddr, String message) {
-                        System.out.println("[" + fromAddr + "] " + message);
+                        System.out.println("[" + fromAddr + "]: " + message);
                     }
+
                     @Override
                     public void onNeighborsChanged(Set<Byte> currentNeighbors) {
-                        // Optional: do something if needed
+                        // Could display or log neighbor changes if desired
                     }
                 }
         );
 
-        layer.start();
+        layer.start();  // starts receiving loop, MAC loop, address assignment, etc.
 
         // Simple CLI
         Scanner sc = new Scanner(System.in);
-        System.out.println("Enter commands or messages. Type '/list' to list neighbors, '/quit' to exit.");
+        System.out.println("Commands: /list, /whisper <addr> <msg>, /quit");
         while (true) {
             String line = sc.nextLine();
             if (line.equalsIgnoreCase("/quit")) {
@@ -67,19 +68,19 @@ public class MyProtocol {
             } else if (line.equalsIgnoreCase("/list")) {
                 Set<Byte> neighs = layer.getNeighbors();
                 System.out.println("Neighbors: " + neighs);
+                System.out.println("My Address: " + layer.getLocalAddress());
             } else if (line.startsWith("/whisper ")) {
-                // e.g. "/whisper 2 Hello"
                 String[] parts = line.split(" ", 3);
                 if (parts.length < 3) {
                     System.out.println("Usage: /whisper <destAddr> <message>");
                     continue;
                 }
-                byte dest = (byte)Integer.parseInt(parts[1]);
+                byte dest = (byte) Integer.parseInt(parts[1]);
                 String msg = parts[2];
                 layer.sendChatMessage(msg, dest);
             } else {
-                // Broadcast
-                layer.sendChatMessage(line, (byte)0xFF); // 0xFF = broadcast
+                // broadcast
+                layer.sendChatMessage(line, ProtocolLayer.BROADCAST_ADDR);
             }
         }
     }
