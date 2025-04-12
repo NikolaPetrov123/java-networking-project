@@ -2,52 +2,110 @@ import client.*;
 
 import java.nio.ByteBuffer;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.Set;
+import java.util.Collections;
+import java.util.HashSet;
 
 /**
-* This is just some example code to show you how to interact 
-* with the server using the provided client and two queues.
-* Feel free to modify this code in any way you like!
-*/
+ * MyProtocol using DATA messages with a prefix to announce static addresses.
+ *
+ * Each node periodically sends an announcement: "ADDR:<staticAddress>"
+ * Nodes listen for these announcements and update their neighbor list accordingly.
+ * This version does not use regex for extraction; it simply uses the known fixed prefix
+ * and the length of the static address to extract the announcement.
+ */
+public class MyProtocol {
 
-public class MyProtocol{
-
-    // The host to connect to. Set this to localhost when using the audio interface tool.
-    private static String SERVER_IP = "netsys.ewi.utwente.nl"; //"127.0.0.1";
-    // The port to connect to. 8954 for the simulation server.
+    // Connection parameters.
+    private static String SERVER_IP = "netsys.ewi.utwente.nl"; // or "127.0.0.1" for local testing
     private static int SERVER_PORT = 8954;
-    // The frequency to use.
-    private static int frequency = 2720;//TODO: Set this to your group frequency!
-    // View the simulator at https://netsys.ewi.utwente.nl/integrationproject/
-    // The token you received for your frequency range
+    private static int frequency = 2720; // TODO: Set this to your group frequency
+    // Token for your frequency range.
     String token = "java-22-B35DAB54DF6BBA640D";
+
+    // The static address for this node.
+    private String staticAddress;
 
     private BlockingQueue<Message> receivedQueue;
     private BlockingQueue<Message> sendingQueue;
 
-    public MyProtocol(String server_ip, int server_port, int frequency){
+    // Set for storing neighbor addresses.
+    private Set<String> neighbors = Collections.synchronizedSet(new HashSet<>());
+    // Indicates whether the handshake (i.e. token acceptance) is complete.
+    private volatile boolean tokenAccepted = false;
+
+    public MyProtocol(String server_ip, int server_port, int frequency, String staticAddress) {
+        this.staticAddress = staticAddress;
+
         receivedQueue = new LinkedBlockingQueue<Message>();
         sendingQueue = new LinkedBlockingQueue<Message>();
 
-        new Client(SERVER_IP, SERVER_PORT, frequency, token, receivedQueue, sendingQueue); // Give the client the Queues to use
+        // Initialize the client (this sets up sender and listener threads).
+        new Client(SERVER_IP, SERVER_PORT, frequency, token, receivedQueue, sendingQueue);
 
-        new receiveThread(receivedQueue).start(); // Start thread to handle received messages!
+        // Start a thread to process received messages.
+        new ReceiveThread(receivedQueue, staticAddress).start();
 
-        // handle sending from stdin from this thread.
-        try{
+        // After token acceptance, immediately send the address announcement.
+        new Thread(() -> {
+            try {
+                while (!tokenAccepted) {
+                    Thread.sleep(100);
+                }
+                sendAddressAnnouncement();
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
+        }).start();
+
+        // Periodically re-send the address announcement (every 10 seconds) to re-advertise presence.
+        new Thread(() -> {
+            try {
+                while (true) {
+                    if (tokenAccepted) {
+                        sendAddressAnnouncement();
+                    }
+                    Thread.sleep(10000);
+                }
+            } catch (InterruptedException e) {
+                // Handle thread interruption if needed.
+            }
+        }).start();
+
+        // Main thread: handle user input from standard input.
+        try {
             ByteBuffer temp = ByteBuffer.allocate(1024);
-            int read = 0;
-            int new_line_offset = 0;
-            while(true){
-                read = System.in.read(temp.array()); // Get data from stdin, hit enter to send!
-                if(read > 0){
-                    if (temp.get(read-1) == '\n' || temp.get(read-1) == '\r' ) new_line_offset = 1; //Check if last char is a return or newline so we can strip it
-                    if (read > 1 && (temp.get(read-2) == '\n' || temp.get(read-2) == '\r') ) new_line_offset = 2; //Check if second to last char is a return or newline so we can strip it
-                    ByteBuffer toSend = ByteBuffer.allocate(read-new_line_offset); // copy data without newline / returns
-                    toSend.put( temp.array(), 0, read-new_line_offset ); // enter data without newline / returns
+            int read;
+            int newLineOffset = 0;
+            while (true) {
+                read = System.in.read(temp.array());
+                if (read > 0) {
+                    String input = new String(temp.array(), 0, read).trim();
+                    // "list" prints the neighbor table.
+                    if (input.equalsIgnoreCase("list")) {
+                        System.out.println("Known neighbors:");
+                        synchronized (neighbors) {
+                            for (String addr : neighbors) {
+                                System.out.println(addr);
+                            }
+                        }
+                        continue;
+                    }
+                    // Remove newline/carriage-return characters.
+                    if (temp.get(read - 1) == '\n' || temp.get(read - 1) == '\r')
+                        newLineOffset = 1;
+                    if (read > 1 && (temp.get(read - 2) == '\n' || temp.get(read - 2) == '\r'))
+                        newLineOffset = 2;
+                    ByteBuffer toSend = ByteBuffer.allocate(read - newLineOffset);
+                    toSend.put(temp.array(), 0, read - newLineOffset);
+                    toSend.flip();
+
                     Message msg;
-                    if( (read-new_line_offset) > 2 ){
+                    // Send as DATA if longer than 2 bytes; otherwise as DATA_SHORT.
+                    if ((read - newLineOffset) > 2) {
                         msg = new Message(MessageType.DATA, toSend);
                     } else {
                         msg = new Message(MessageType.DATA_SHORT, toSend);
@@ -55,68 +113,115 @@ public class MyProtocol{
                     sendingQueue.put(msg);
                 }
             }
-        } catch (InterruptedException e){
+        } catch (InterruptedException e) {
             System.exit(2);
-        } catch (IOException e){
+        } catch (IOException e) {
             System.exit(2);
-        }        
+        }
+    }
+
+    /**
+     * Sends an announcement using a DATA message that contains a string with the prefix "ADDR:".
+     */
+    private void sendAddressAnnouncement() {
+        String announcement = "ADDR:" + staticAddress;
+        ByteBuffer buf = ByteBuffer.wrap(announcement.getBytes(StandardCharsets.UTF_8));
+        try {
+            sendingQueue.put(new Message(MessageType.DATA, buf));
+            System.out.println("Sent address announcement: " + announcement);
+        } catch (InterruptedException e) {
+            System.err.println("Failed to send address announcement: " + e);
+        }
     }
 
     public static void main(String args[]) {
-        if(args.length > 0){
+        if (args.length > 0) {
             frequency = Integer.parseInt(args[0]);
         }
-        new MyProtocol(SERVER_IP, SERVER_PORT, frequency);        
+        String staticAddr = "node4"; // Default address.
+        if (args.length > 1) {
+            staticAddr = args[1];
+        }
+        new MyProtocol(SERVER_IP, SERVER_PORT, frequency, staticAddr);
     }
 
-    private class receiveThread extends Thread {
+    /**
+     * The ReceiveThread processes incoming messages.
+     * If a received DATA or DATA_SHORT message contains an address announcement starting with "ADDR:",
+     * we use a fixed substring extraction (knowing the length of our static address) to update the neighbor list.
+     */
+    private class ReceiveThread extends Thread {
         private BlockingQueue<Message> receivedQueue;
+        private String staticAddress;
 
-        public receiveThread(BlockingQueue<Message> receivedQueue){
+        public ReceiveThread(BlockingQueue<Message> receivedQueue, String staticAddress) {
             super();
             this.receivedQueue = receivedQueue;
+            this.staticAddress = staticAddress;
         }
 
-        public void printByteBuffer(ByteBuffer bytes, int bytesLength){
-            for(int i=0; i<bytesLength; i++){
-                System.out.print( Byte.toString( bytes.get(i) )+" " );
-            }
-            System.out.println();
-        }
-
-        public void run(){
-            while(true) {
-                try{
+        public void run() {
+            while (true) {
+                try {
                     Message m = receivedQueue.take();
-                    if (m.getType() == MessageType.BUSY){
-                        System.out.println("BUSY");
-                    } else if (m.getType() == MessageType.FREE){
-                        System.out.println("FREE");
-                    } else if (m.getType() == MessageType.DATA){
-                        System.out.print("DATA: ");
-                        printByteBuffer( m.getData(), m.getData().capacity() ); //Just print the data
-                    } else if (m.getType() == MessageType.DATA_SHORT){
-                        System.out.print("DATA_SHORT: ");
-                        printByteBuffer( m.getData(), m.getData().capacity() ); //Just print the data
-                    } else if (m.getType() == MessageType.DONE_SENDING){
-                        System.out.println("DONE_SENDING");
-                    } else if (m.getType() == MessageType.HELLO){
-                        System.out.println("HELLO");
-                    } else if (m.getType() == MessageType.SENDING){
-                        System.out.println("SENDING");
-                    } else if (m.getType() == MessageType.END){
-                        System.out.println("END");
-                        System.exit(0);
-                    } else if (m.getType() == MessageType.TOKEN_ACCEPTED){
-                        System.out.println("Token Valid!");
-                    } else if (m.getType() == MessageType.TOKEN_REJECTED){
-                        System.out.println("Token Rejected!");
+                    switch (m.getType()) {
+                        case TOKEN_ACCEPTED:
+                            System.out.println("Token Valid!");
+                            tokenAccepted = true;
+                            break;
+                        case TOKEN_REJECTED:
+                            System.out.println("Token Rejected!");
+                            break;
+                        case HELLO:
+                            System.out.println("HELLO");
+                            break;
+                        case FREE:
+                            System.out.println("FREE");
+                            break;
+                        case BUSY:
+                            System.out.println("BUSY");
+                            break;
+                        case SENDING:
+                            System.out.println("SENDING");
+                            break;
+                        case DONE_SENDING:
+                            System.out.println("DONE_SENDING");
+                            break;
+                        case END:
+                            System.out.println("END received");
+                            break;
+                        case DATA:
+                        case DATA_SHORT:
+                            // Convert the ByteBuffer to a string.
+                            ByteBuffer data = m.getData();
+                            data.rewind();
+                            byte[] bytes = new byte[data.remaining()];
+                            data.get(bytes);
+                            String messageText = new String(bytes, StandardCharsets.UTF_8).trim();
+
+                            // Check if the message is an address announcement.
+                            if (messageText.startsWith("ADDR:")) {
+                                // Extract exactly the intended static address.
+                                // We know the announcement format is "ADDR:" followed immediately by the address.
+                                // So take the substring of length equal to "ADDR:".length() + staticAddress.length().
+                                String addr = messageText.substring(5,10).trim();
+                                if(!addr.equals(staticAddress)){
+                                    if(neighbors.add(addr)){
+                                        System.out.println("Received address announcement from: " + addr);
+                                    }
+                                }
+                            } else {
+                                System.out.println("DATA: " + messageText);
+                            }
+                            break;
+                        default:
+                            System.out.println("Unknown message type received.");
+                            break;
                     }
-                } catch (InterruptedException e){
-                    System.err.println("Failed to take from queue: "+e);
-                }                
+                } catch (InterruptedException e) {
+                    System.err.println("Failed to take from queue: " + e);
+                }
             }
         }
     }
 }
-
