@@ -10,70 +10,93 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.Set;
 import java.util.Map;
+import protocol.MessageFragmentBuffer;
 
 /**
- * ProtocolLayer handles:
- *   - Dynamic Addressing (if localAddress==0)
- *   - MAC (naive random backoff)
- *   - Stop-and-Wait reliability (ACKs)
- *   - Basic multi-hop broadcast
- *   - Neighbor discovery
+ * ProtocolLayer with:
+ *  1) Dynamic Addressing (if localAddress=0)
+ *  2) MAC with naive random backoff
+ *  3) Stop-and-Wait reliability
+ *  4) Distance Vector routing for multi-hop unicast
+ *  5) Basic broadcast/flood
  */
 public class ProtocolLayer {
 
-    // ========== Constants ==========
+    // ================= Constants =================
 
     public static final byte BROADCAST_ADDR = (byte) 0xFF;
 
-    // Byte-level frames from the emulator: 32 max
+    // Frame sizes
     private static final int MAX_DATA_LEN = 32;
-    // We'll store a 7-byte (or more) header for normal data/ACK:
-    private static final int HEADER_LEN = 7;
+    private static final int HEADER_LEN   = 7;
 
-    // Control flags (previous + new)
-    private static final byte FLAG_DATA        = 0x00;
-    private static final byte FLAG_HELLO       = 0x01;
-    private static final byte FLAG_ACK         = 0x02;
-    private static final byte FLAG_ADDR_CLAIM  = 0x03; // new
-    private static final byte FLAG_ADDR_CONFLICT = 0x04; // new
+    // Control flags
+    private static final byte FLAG_DATA          = 0x00;
+    private static final byte FLAG_HELLO         = 0x01;
+    private static final byte FLAG_ACK           = 0x02;
+    private static final byte FLAG_ADDR_CLAIM    = 0x03;
+    private static final byte FLAG_ADDR_CONFLICT = 0x04;
+    // New for Distance Vector
+    private static final byte FLAG_DV            = 0x05;
 
-    // If we haven't assigned an address, we set isAddressAssigned = false.
-    // Then we do dynamic addressing.
+    // If initialAddress != 0, we skip dynamic assignment
     private volatile boolean isAddressAssigned = false;
 
-    // ========== Fields ==========
+    // ================= Fields =================
 
     private volatile byte localAddress;
-    private BlockingQueue<Message> recvQueue; // from Client.Listener
-    private BlockingQueue<Message> sendQueue; // to Client.Sender
+    private BlockingQueue<Message> recvQueue;
+    private BlockingQueue<Message> sendQueue;
 
-    // The MAC queue
+    // The "MAC TX" queue
     private BlockingQueue<ByteBuffer> macTxQueue = new LinkedBlockingQueue<>();
 
     // Channel busy/free
     private volatile boolean channelBusy = false;
 
-    // Neighbors: neighborAddr -> lastHeardTime
+    // Neighbors
     private ConcurrentHashMap<Byte, Long> neighbors = new ConcurrentHashMap<>();
     private static final long NEIGHBOR_TIMEOUT_MS = 30000; // 30s
 
-    // Reassembly storage
+    // Reassembly for multi-fragment messages
     private Map<String, MessageFragmentBuffer> reassemblyMap = new ConcurrentHashMap<>();
+    // For ignoring duplicate fragments
     private Set<String> seenFragmentIds = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-    // For delivering messages to MyProtocol
+    // Callback for delivering user messages up to the app
     public interface ProtocolCallback {
         void onReceivedChatMessage(String fromAddr, String message);
         void onNeighborsChanged(Set<Byte> currentNeighbors);
     }
     private ProtocolCallback callback;
 
-    // ACK manager for Stop-and-Wait
+    // Stop-and-Wait ACK manager
     private AckManager ackManager = new AckManager();
 
     // For dynamic addressing
     private final Object addrLock = new Object();
-    private static final int ADDR_ASSIGN_TIMEOUT_MS = 3000; // Grace period to detect conflicts
+    private boolean hasConflict = false;
+    private byte localConflictCandidate = 0;
+    private static final int ADDR_ASSIGN_TIMEOUT_MS = 3000;
+
+    // =============== Distance Vector ===============
+    // We'll store a table: destination -> (distance, nextHop)
+    // Distance is a simple hop count. nextHop = immediate neighbor used.
+    // Infinity = 999
+    private static final int INFINITY = 999;
+    private Map<Byte, RouteInfo> routingTable = new ConcurrentHashMap<>();
+
+    // We'll broadcast DV every 10s, or when changes occur. For simplicity, let's do periodic.
+    private static final long DV_BROADCAST_INTERVAL_MS = 10000;
+
+    private static class RouteInfo {
+        public int distance;   // hop count
+        public byte nextHop;
+        public RouteInfo(int distance, byte nextHop) {
+            this.distance = distance;
+            this.nextHop = nextHop;
+        }
+    }
 
     public ProtocolLayer(byte initialAddress,
                          BlockingQueue<Message> recvQueue,
@@ -85,49 +108,46 @@ public class ProtocolLayer {
         this.sendQueue = sendQueue;
         this.callback = callback;
 
-        // If initialAddress != 0, we consider that assigned (static). Otherwise, dynamic.
         if (this.localAddress != 0) {
             isAddressAssigned = true;
+            // Initialize routing table to reflect that we know ourselves at dist=0
+            routingTable.put(localAddress, new RouteInfo(0, localAddress));
         }
     }
 
-    // ========== Lifecycle ==========
+    // ============= Lifecycle Methods =============
 
     public void start() {
-        // 1) Start the thread that processes incoming frames
+        // Main receiving thread
         new Thread(this::receiveLoop, "Protocol-ReceiveLoop").start();
 
-        // 2) Start the MAC loop
+        // MAC loop
         new Thread(this::macLoop, "Protocol-MacLoop").start();
 
-        // 3) Possibly do dynamic addressing if localAddress == 0
+        // Dynamic addressing if needed
         if (!isAddressAssigned) {
             new Thread(this::addressAssignmentLoop, "AddressAssignmentLoop").start();
         }
 
-        // 4) Once we have an address, do normal HELLO
+        // HELLO + neighbor cleanup
         new Thread(this::helloLoop, "Protocol-HelloLoop").start();
+
+        // Distance Vector broadcast loop
+        new Thread(this::dvLoop, "Protocol-DVLoop").start();
     }
 
-    /**
-     * For the application: get our final local address (once assigned).
-     */
     public byte getLocalAddress() {
         return localAddress;
     }
 
-    // ========== Public Chat API ==========
-
     /**
-     * Send a user message (fragmented + Stop-and-Wait ACK)
+     * For the application: send a chat message (Stop-and-Wait) to a unicast or broadcast.
      */
     public void sendChatMessage(String message, byte destAddr) {
-        // If not assigned yet, we might want to block or reject. For a simple approach:
         if (!isAddressAssigned) {
-            System.out.println("Address not assigned yet. Cannot send chat message.");
+            System.out.println("Address not assigned yet, cannot send messages.");
             return;
         }
-
         new Thread(() -> {
             try {
                 stopAndWaitSend(message, destAddr);
@@ -137,40 +157,25 @@ public class ProtocolLayer {
         }, "StopAndWaitSender").start();
     }
 
-    /**
-     * Returns an unmodifiable set of known neighbors
-     */
     public Set<Byte> getNeighbors() {
         return Collections.unmodifiableSet(neighbors.keySet());
     }
 
-    // ========== Private Methods ==========
+    // ============= Dynamic Addressing =============
 
-    /**
-     * If localAddress == 0, we repeatedly pick a random address, broadcast an ADDR_CLAIM,
-     * wait to see if we get an ADDR_CONFLICT. If none, we finalize. If conflict, pick again.
-     */
     private void addressAssignmentLoop() {
         Random rand = new Random();
         while (!isAddressAssigned) {
-            // 1) pick a random address in [1..200], for instance
+            // Pick a random address in [1..200]
             byte candidate = (byte) (1 + rand.nextInt(200));
-
-            // 2) broadcast ADDR_CLAIM with that candidate
             System.out.println("Attempting to claim address: " + candidate);
             broadcastAddressClaim(candidate);
 
-            // 3) Wait ADDR_ASSIGN_TIMEOUT_MS for conflicts
+            // Wait for conflicts
             boolean conflict = false;
-            long startTime = System.currentTimeMillis();
-            while (System.currentTimeMillis() - startTime < ADDR_ASSIGN_TIMEOUT_MS) {
-                // We'll sleep small intervals and check for conflicts
-                if (localAddress != 0) {
-                    // Means we somehow got assigned in the meantime
-                    break;
-                }
+            long start = System.currentTimeMillis();
+            while (System.currentTimeMillis() - start < ADDR_ASSIGN_TIMEOUT_MS) {
                 synchronized (addrLock) {
-                    // Did we mark a conflict? We'll see below
                     if (localConflictCandidate == candidate) {
                         conflict = true;
                         break;
@@ -179,28 +184,27 @@ public class ProtocolLayer {
                 try {
                     Thread.sleep(100);
                 } catch (InterruptedException e) {
-                    return; // stop
+                    return;
                 }
             }
-
             if (!conflict) {
-                // We assume success
+                // finalize
                 synchronized (addrLock) {
                     if (!hasConflict) {
                         localAddress = candidate;
                         isAddressAssigned = true;
-                        System.out.println("Successfully assigned address: " + localAddress);
+                        System.out.println("Assigned address: " + localAddress);
+                        // Setup routingTable for ourselves
+                        routingTable.put(localAddress, new RouteInfo(0, localAddress));
                     } else {
-                        // If we discovered conflict after all
-                        System.out.println("Conflict found, retrying...");
+                        System.out.println("Conflict found after all, retrying...");
                         hasConflict = false;
                         localConflictCandidate = 0;
                     }
                 }
             } else {
-                // conflict = true
                 synchronized (addrLock) {
-                    System.out.println("Conflict detected for address: " + candidate + ". Retrying...");
+                    System.out.println("Conflict detected for address " + candidate + ", retrying...");
                     hasConflict = false;
                     localConflictCandidate = 0;
                 }
@@ -208,28 +212,139 @@ public class ProtocolLayer {
         }
     }
 
-    // We'll store some simple conflict signals here
-    private boolean hasConflict = false;
-    private byte localConflictCandidate = 0;
-
     private void broadcastAddressClaim(byte candidate) {
         ByteBuffer buf = buildFrameHeader(
                 FLAG_ADDR_CLAIM,
-                (byte)0, // 0 means "unassigned" from me
+                (byte)0, // src=0 means unassigned
                 BROADCAST_ADDR,
-                (short) 0,  // messageID
-                (byte) 0,   // fragIdx
-                (byte) 1    // totalFrags
+                (short)0, (byte)0, (byte)1
         );
-        // We'll put 1 byte of "candidate" in the payload
         buf.put(candidate);
         buf.flip();
         macTxQueue.offer(buf);
     }
 
+    // ============= Distance Vector =============
+
     /**
-     * The main receiving loop
+     * Periodically broadcast our routing table to neighbors.
      */
+    private void dvLoop() {
+        try {
+            while (true) {
+                Thread.sleep(DV_BROADCAST_INTERVAL_MS);
+                if (isAddressAssigned) {
+                    broadcastDistanceVector();
+                }
+            }
+        } catch (InterruptedException e) {
+            // end
+        }
+    }
+
+    /**
+     * Send our routing table in a broadcast frame with FLAG_DV.
+     * Payload format: [countEntries, (addr, distance), (addr, distance), ...]
+     * We'll store distance as a single byte if < 255, otherwise 255 for "infinity".
+     */
+    private void broadcastDistanceVector() {
+        // Build the table in a byte array
+        List<Byte> payloadList = new ArrayList<>();
+        // We'll skip ourselves or we can include ourselves. Let's include everything.
+        Set<Byte> destinations = routingTable.keySet();
+
+        // max possible entries is 255 if there's a huge network
+        int count = destinations.size();
+        payloadList.add((byte) count);
+
+        for (Byte dest : destinations) {
+            RouteInfo ri = routingTable.get(dest);
+            payloadList.add(dest);
+            // clamp distance to 255 if > 255
+            int dist = (ri.distance > 255) ? 255 : ri.distance;
+            payloadList.add((byte) dist);
+        }
+
+        // Convert to array
+        byte[] payload = new byte[payloadList.size()];
+        for (int i = 0; i < payloadList.size(); i++) {
+            payload[i] = payloadList.get(i);
+        }
+
+        // Build the frame
+        ByteBuffer frame = buildFrameHeader(FLAG_DV, localAddress, BROADCAST_ADDR,
+                                            (short)0, (byte)0, (byte)1);
+        frame.put(payload);
+        frame.flip();
+        macTxQueue.offer(frame);
+    }
+
+    /**
+     * Parse a DV frame from neighbor srcAddr, update local table using Bellman-Ford logic:
+     *  dist(me->X) > dist(me->srcAddr) + dist(srcAddr->X)
+     */
+    private void handleDistanceVector(byte srcAddr, byte[] payload) {
+        // parse
+        if (payload.length < 1) return;
+        int count = payload[0] & 0xFF;
+        int idx = 1;
+        // Ensure we have the correct length
+        if (payload.length < 1 + count*2) {
+            System.out.println("DV parse error: not enough bytes");
+            return;
+        }
+
+        // distance to neighbor srcAddr is presumably 1 hop, or maybe we track direct neighbors as 1
+        int distToNeighbor = getDistanceTo(srcAddr);
+        if (distToNeighbor == INFINITY) {
+            // We don't have a direct route to srcAddr yet? We'll consider it 1 hop if it's in neighbors
+            if (neighbors.containsKey(srcAddr)) {
+                distToNeighbor = 1;
+                // Insert or update local route to srcAddr
+                updateRoute(srcAddr, 1, srcAddr);
+            } else {
+                // We got a DV from a node we don't think is reachable. Possibly a multi-hop scenario?
+                // We'll guess it's dist=1 if we see it directly.
+                distToNeighbor = 1;
+                updateRoute(srcAddr, 1, srcAddr);
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            byte dest = payload[idx++];
+            int theirDist = (payload[idx++] & 0xFF);
+            // Bellman-Ford: potential distance = dist(me->srcAddr) + theirDist
+            int newDist = distToNeighbor + theirDist;
+            // If newDist < dist(me->dest), update
+            int oldDist = getDistanceTo(dest);
+            if (newDist < oldDist) {
+                // update route
+                updateRoute(dest, newDist, srcAddr);
+            }
+        }
+    }
+
+    /**
+     * Get the current known distance to some destination. If not known, return INFINITY.
+     */
+    private int getDistanceTo(byte dest) {
+        RouteInfo ri = routingTable.get(dest);
+        if (ri == null) return INFINITY;
+        return ri.distance;
+    }
+
+    /**
+     * Update or insert route in our table. Then we might want to re-broadcast.
+     * We'll just do a quick update for now. We might do a triggered DV broadcast if desired.
+     */
+    private void updateRoute(byte dest, int dist, byte nextHop) {
+        routingTable.put(dest, new RouteInfo(dist, nextHop));
+        // Optionally: print debug
+        System.out.println("Node " + localAddress + " updated route to " + dest + ": dist=" + dist + ", nextHop=" + nextHop);
+    }
+
+    // ============= Receiving Loop =============
+
     private void receiveLoop() {
         while (true) {
             try {
@@ -247,7 +362,7 @@ public class ProtocolLayer {
                         break;
                     case SENDING:
                     case DONE_SENDING:
-                        // Could track progress if desired
+                        // track if needed
                         break;
                     default:
                         // token accepted, token rejected, etc.
@@ -260,17 +375,13 @@ public class ProtocolLayer {
         }
     }
 
-    /**
-     * Parse incoming frames and handle them
-     */
     private void handleIncomingData(ByteBuffer buf) {
         buf.rewind();
         byte[] raw = new byte[buf.remaining()];
         buf.get(raw);
 
         if (raw.length < HEADER_LEN) {
-            // too short
-            return;
+            return; // too short
         }
 
         byte controlFlags   = raw[0];
@@ -284,133 +395,102 @@ public class ProtocolLayer {
         byte[] payload = new byte[payloadLen];
         System.arraycopy(raw, HEADER_LEN, payload, 0, payloadLen);
 
-        // If srcAddr != 0, that means the sender has an assigned address. Update neighbor info
+        // If srcAddr != 0, update neighbor
         if (srcAddr != 0) {
             updateNeighbor(srcAddr);
+            // Also ensure route to srcAddr is at most 1 hop
+            if (getDistanceTo(srcAddr) > 1) {
+                updateRoute(srcAddr, 1, srcAddr);
+            }
         }
 
-        // Dispatch by controlFlags
         switch (controlFlags) {
             case FLAG_HELLO:
-                // we do nothing else, neighbor updated
+                // done
                 return;
-
             case FLAG_ACK:
-                // It's an ACK for some data fragment
+                // It's an ACK for a unicast. Let the ackManager know
                 String ackKey = ackManager.makeAckKey(dstAddr, messageID, fragmentIndex);
                 ackManager.notifyAck(ackKey);
                 return;
-
             case FLAG_ADDR_CLAIM:
                 handleAddrClaim(srcAddr, payload);
                 return;
-
             case FLAG_ADDR_CONFLICT:
                 handleAddrConflict(payload);
                 return;
-
+            case FLAG_DV:
+                // This is a distance vector from srcAddr
+                handleDistanceVector(srcAddr, payload);
+                return;
             default:
-                // It's normal data or something else
+                // It's normal data
                 handleNormalData(controlFlags, srcAddr, dstAddr, messageID, fragmentIndex, totalFrags, payload);
-                break;
         }
     }
 
-    /**
-     * Handle receiving an address claim from an unassigned node.
-     * "payload[0]" is the candidate address they want.
-     */
-    private void handleAddrClaim(byte srcAddr, byte[] payload) {
-        if (payload.length < 1) return;
-        byte claimed = payload[0];
-
-        // If we are using that address ourselves, or we have a known neighbor using that address, conflict.
-        if (isAddressAssigned && localAddress == claimed) {
-            // We broadcast conflict
-            broadcastAddressConflict(claimed);
-        } else {
-            // Check neighbors
-            for (Byte n : neighbors.keySet()) {
-                if (n == claimed) {
-                    broadcastAddressConflict(claimed);
-                    break;
-                }
-            }
-        }
-    }
-
-    /**
-     * Broadcast address conflict for a specific address
-     */
-    private void broadcastAddressConflict(byte claimed) {
-        ByteBuffer buf = buildFrameHeader(
-                FLAG_ADDR_CONFLICT,
-                localAddress,
-                BROADCAST_ADDR,
-                (short)0, (byte)0, (byte)1
-        );
-        buf.put(claimed);
-        buf.flip();
-        macTxQueue.offer(buf);
-    }
-
-    /**
-     * If we are in the middle of claiming an address, seeing a conflict sets a flag.
-     */
-    private void handleAddrConflict(byte[] payload) {
-        if (payload.length < 1) return;
-        byte claimed = payload[0];
-
-        // If we are not assigned yet, and we're attempting that address => conflict
-        if (!isAddressAssigned) {
-            synchronized (addrLock) {
-                localConflictCandidate = claimed;
-                hasConflict = true;
-            }
-        }
-    }
+    // ============= Normal Data (Unicast or Broadcast) =============
 
     private void handleNormalData(byte controlFlags, byte srcAddr, byte dstAddr,
                                   short messageID, byte fragIndex, byte totalFrags,
                                   byte[] payload)
     {
-        // Flood / duplication check
         String fragKey = srcAddr + ":" + messageID + ":" + fragIndex;
         if (seenFragmentIds.contains(fragKey)) {
             return;
         }
         seenFragmentIds.add(fragKey);
 
-        // Basic broadcast forward
         if (dstAddr == BROADCAST_ADDR && srcAddr != localAddress) {
+            // forward broadcast
             forwardBroadcast(controlFlags, srcAddr, dstAddr, messageID, fragIndex, totalFrags, payload);
         }
-
-        // If we are the final dest or broadcast, reassemble & deliver
-        if (dstAddr == localAddress || dstAddr == BROADCAST_ADDR) {
-            reassembleAndDeliver(srcAddr, messageID, fragIndex, totalFrags, payload);
-            // send an ACK
-            if (controlFlags == FLAG_DATA) {
-                sendAckTo(srcAddr, messageID, fragIndex);
+        else if (dstAddr != localAddress && dstAddr != BROADCAST_ADDR) {
+            // unicast, but we're not final. we should forward if we have a route
+            if (routingTable.containsKey(dstAddr)) {
+                byte nextHop = routingTable.get(dstAddr).nextHop;
+                if (nextHop == localAddress) {
+                    // Strange: means we think we are the best route to get to ourselves?
+                    // Possibly a routing table confusion. We'll discard.
+                    System.out.println("Routing loop or invalid route for " + dstAddr + " - discarding.");
+                    return;
+                }
+                // forward unicast to nextHop
+                forwardUnicast(controlFlags, srcAddr, dstAddr, messageID, fragIndex, totalFrags, payload, nextHop);
+            } else {
+                System.out.println("No route to " + dstAddr + " from " + localAddress + ", discarding.");
             }
+            return;
+        }
+
+        // If we are final or broadcast
+        reassembleAndDeliver(srcAddr, messageID, fragIndex, totalFrags, payload);
+        // If it's normal data, send ACK (Stop-and-Wait)
+        if (controlFlags == FLAG_DATA && dstAddr != BROADCAST_ADDR) {
+            sendAckTo(srcAddr, messageID, fragIndex);
         }
     }
 
-    /**
-     * Forward broadcast frames
-     */
     private void forwardBroadcast(byte controlFlags, byte srcAddr, byte dstAddr,
-                                  short msgID, byte fragIdx, byte totalFrags, byte[] payload)
+                                  short messageID, byte fragIndex, byte totalFrags,
+                                  byte[] payload)
     {
-        ByteBuffer frame = buildFrameHeader(controlFlags, srcAddr, dstAddr, msgID, fragIdx, totalFrags);
+        ByteBuffer frame = buildFrameHeader(controlFlags, srcAddr, dstAddr, messageID, fragIndex, totalFrags);
         frame.put(payload);
         frame.flip();
         macTxQueue.offer(frame);
     }
 
-    /**
-     * Reassemble + deliver
-     */
+    private void forwardUnicast(byte controlFlags, byte srcAddr, byte dstAddr,
+                                short messageID, byte fragIdx, byte totalFrags,
+                                byte[] payload, byte nextHop)
+    {
+        ByteBuffer frame = buildFrameHeader(controlFlags, srcAddr, dstAddr, messageID, fragIdx, totalFrags);
+        frame.put(payload);
+        frame.flip();
+        macTxQueue.offer(frame);
+    }
+
     private void reassembleAndDeliver(byte srcAddr, short messageID,
                                       byte fragIndex, byte totalFrags, byte[] payload)
     {
@@ -420,8 +500,8 @@ public class ProtocolLayer {
             buf = new MessageFragmentBuffer(totalFrags);
             reassemblyMap.put(mapKey, buf);
         }
-
         buf.addFragment(fragIndex, payload);
+
         if (buf.isComplete()) {
             byte[] fullData = buf.reassemble();
             String msgText = new String(fullData, StandardCharsets.UTF_8);
@@ -432,9 +512,8 @@ public class ProtocolLayer {
         }
     }
 
-    /**
-     * Send a data fragment with Stop-and-Wait reliability
-     */
+    // ============= Stop-and-Wait Send =============
+
     private void stopAndWaitSend(String message, byte destAddr) throws InterruptedException {
         byte[] dataBytes = message.getBytes(StandardCharsets.UTF_8);
         short msgID = (short) new Random().nextInt(Short.MAX_VALUE);
@@ -454,7 +533,6 @@ public class ProtocolLayer {
             frame.put(fragment);
             frame.flip();
 
-            // ack key
             String ackKey = ackManager.makeAckKey(localAddress, msgID, (byte)fragIdx);
 
             boolean acked = false;
@@ -469,14 +547,11 @@ public class ProtocolLayer {
             }
             if (!acked) {
                 System.out.println("Stop-and-Wait: giving up after " + MAX_RETRIES + " attempts.");
-                return; // stop sending further fragments
+                return;
             }
         }
     }
 
-    /**
-     * Send an ACK
-     */
     private void sendAckTo(byte destAddr, short messageID, byte fragIndex) {
         ByteBuffer ackFrame = buildFrameHeader(
                 FLAG_ACK,
@@ -484,48 +559,68 @@ public class ProtocolLayer {
                 destAddr,
                 messageID,
                 fragIndex,
-                (byte)1  // totalFrags=1 for an ACK
+                (byte)1
         );
         ackFrame.flip();
         macTxQueue.offer(ackFrame);
     }
 
-    /**
-     * Build a frame with the 7-byte header
-     */
-    private ByteBuffer buildFrameHeader(byte controlFlags, byte srcAddr, byte dstAddr,
-                                        short messageID, byte fragmentIndex, byte totalFrags)
-    {
-        ByteBuffer buf = ByteBuffer.allocate(MAX_DATA_LEN);
-        buf.put(controlFlags);
-        buf.put(srcAddr);
-        buf.put(dstAddr);
-        buf.putShort(messageID);
-        buf.put(fragmentIndex);
-        buf.put(totalFrags);
-        return buf;
+    // ============= Address Conflict Handling =============
+
+    private void handleAddrClaim(byte srcAddr, byte[] payload) {
+        if (payload.length < 1) return;
+        byte claimed = payload[0];
+        if (isAddressAssigned && localAddress == claimed) {
+            broadcastAddressConflict(claimed);
+        } else {
+            // check neighbors
+            for (Byte n : neighbors.keySet()) {
+                if (n == claimed) {
+                    broadcastAddressConflict(claimed);
+                    break;
+                }
+            }
+        }
     }
 
-    /**
-     * MAC loop: wait for free, random backoff, etc.
-     */
+    private void broadcastAddressConflict(byte claimed) {
+        ByteBuffer buf = buildFrameHeader(
+                FLAG_ADDR_CONFLICT,
+                localAddress,
+                BROADCAST_ADDR,
+                (short)0, (byte)0, (byte)1
+        );
+        buf.put(claimed);
+        buf.flip();
+        macTxQueue.offer(buf);
+    }
+
+    private void handleAddrConflict(byte[] payload) {
+        if (payload.length < 1) return;
+        byte claimed = payload[0];
+        if (!isAddressAssigned) {
+            synchronized (addrLock) {
+                localConflictCandidate = claimed;
+                hasConflict = true;
+            }
+        }
+    }
+
+    // ============= MAC Loop =============
+
     private void macLoop() {
         Random rand = new Random();
         while (true) {
             try {
                 ByteBuffer frame = macTxQueue.take();
-
                 while (channelBusy) {
                     Thread.sleep(10);
                 }
-                // small random backoff
                 Thread.sleep(10 + rand.nextInt(20));
-
                 if (channelBusy) {
                     macTxQueue.offer(frame);
                     continue;
                 }
-
                 sendQueue.put(new Message(MessageType.DATA, frame));
             } catch (InterruptedException e) {
                 System.err.println("macLoop interrupted: " + e);
@@ -534,10 +629,8 @@ public class ProtocolLayer {
         }
     }
 
-    /**
-     * Periodic Hello + neighbor cleanup
-     * But we only do HELLO if we have an assigned address
-     */
+    // ============= HELLO + Neighbor Cleanup =============
+
     private void helloLoop() {
         try {
             while (true) {
@@ -582,5 +675,20 @@ public class ProtocolLayer {
         if (changed && callback != null) {
             callback.onNeighborsChanged(neighbors.keySet());
         }
+    }
+
+    // ============= Utility =============
+
+    private ByteBuffer buildFrameHeader(byte controlFlags, byte srcAddr, byte dstAddr,
+                                        short messageID, byte fragmentIndex, byte totalFrags)
+    {
+        ByteBuffer buf = ByteBuffer.allocate(MAX_DATA_LEN);
+        buf.put(controlFlags);
+        buf.put(srcAddr);
+        buf.put(dstAddr);
+        buf.putShort(messageID);
+        buf.put(fragmentIndex);
+        buf.put(totalFrags);
+        return buf;
     }
 }
