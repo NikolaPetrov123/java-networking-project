@@ -12,5 +12,6 @@ public enum MessageType {
     TOKEN_ACCEPTED,
     TOKEN_REJECTED,
     ADDRESS,     //For static address announcements
-    ACK
+    ACK,
+    INTENT
 }

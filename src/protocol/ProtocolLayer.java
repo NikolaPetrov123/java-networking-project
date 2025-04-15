@@ -40,6 +40,7 @@ public class ProtocolLayer {
     private static final byte FLAG_ADDR_CLAIM    = 0x03;
     private static final byte FLAG_ADDR_CONFLICT = 0x04;
     private static final byte FLAG_DV            = 0x05;
+    private static final byte FLAG_INTENT        = 0x0E;
 
     // When a static address is provided (nonzero), dynamic addressing is skipped.
     private volatile boolean isAddressAssigned = false;
@@ -83,7 +84,7 @@ public class ProtocolLayer {
     private static final int INFINITY = 999;
     // Routing table: destination -> (distance, nextHop)
     private Map<Byte, RouteInfo> routingTable = new ConcurrentHashMap<>();
-    private static final long DV_BROADCAST_INTERVAL_MS = 10000;
+    private static final long DV_BROADCAST_INTERVAL_MS = 20000;
 
     private static class RouteInfo {
         public int distance;
@@ -93,10 +94,6 @@ public class ProtocolLayer {
             this.nextHop = nextHop;
         }
     }
-
-    // ============ Slotted ALOHA MAC Parameters ============
-    private static final long SLOT_DURATION_MS = 30;    // Slot duration in ms.
-    private static final double TRANSMIT_PROBABILITY = 0.3;   // Probability to transmit at a slot.
 
     // ============ MacFrame Class ============
     private static class MacFrame {
@@ -316,6 +313,28 @@ public class ProtocolLayer {
                     case FREE:
                         channelBusy = false;
                         break;
+                    case INTENT:
+                        // Process the incoming INTENT frame
+                        // Extract a key from the frame so we know if we already relayed it
+                        ByteBuffer intentBuf = msg.getData();
+                        String intentKey = makeIntentKey(intentBuf);
+
+                        // If we haven't already relayed this INTENT, do so.
+                        if (!intentRelayCache.contains(intentKey)) {
+                            intentRelayCache.add(intentKey);
+                            // Optionally, delay slightly to allow the INTENT to propagate naturally
+                            try {
+                                Thread.sleep(10);
+                            } catch (InterruptedException e) {
+                                // Ignore interruption for the relay delay
+                            }
+                            System.out.println("Relaying INTENT from node " + intentBuf.get(1));
+                            sendIntentFrame(); // Relay the INTENT frame.
+                        }
+
+                        // Mark channel as busy, so we do not attempt to transmit our own frame.
+                        channelBusy = true;
+                        break;
                     case DATA:
                     case DATA_SHORT:
                         handleIncomingData(msg.getData());
@@ -514,7 +533,7 @@ public class ProtocolLayer {
             }
         }
         int offset = 0;
-        final int MAX_RETRIES = 5;
+        final int MAX_RETRIES = 10;
         for (int fragIdx = 0; fragIdx < totalFrags; fragIdx++) {
             int length = Math.min(maxPayload, dataBytes.length - offset);
             byte[] fragment = Arrays.copyOfRange(dataBytes, offset, offset + length);
@@ -533,9 +552,12 @@ public class ProtocolLayer {
             while (!acked && attempts < MAX_RETRIES) {
                 attempts++;
                 macTxQueue.offer(new MacFrame(frame.duplicate()));
-                acked = ackManager.waitForAck(ackKey, 2000);
+                acked = ackManager.waitForAck(ackKey, 15000);
                 if (!acked) {
                     System.out.println("No ACK for frag " + fragIdx + ", attempt " + attempts);
+                }
+                else{
+                    System.out.println("ACK for frag " + fragIdx + " received on attempt " +attempts);
                 }
             }
             if (!acked) {
@@ -545,31 +567,136 @@ public class ProtocolLayer {
         }
     }
 
-    // ============ Slotted ALOHA MAC Loop ============
+    // ============ MAC Loop ============
     private void macLoop() {
+        Random rand = new Random();
         while (true) {
-            long now = System.currentTimeMillis();
-            long nextSlot = ((now / SLOT_DURATION_MS) + 1) * SLOT_DURATION_MS;
-            long sleepTime = nextSlot - now;
+            // Wait for a frame to send.
+            MacFrame frame = null;
             try {
-                Thread.sleep(sleepTime);
+                frame = macTxQueue.take();
             } catch (InterruptedException e) {
-                System.err.println("Slot sleep interrupted: " + e);
+                System.err.println("macLoop interrupted while taking frame: " + e);
                 return;
             }
-            if (!channelBusy && Math.random() < TRANSMIT_PROBABILITY) {
-                MacFrame frame = macTxQueue.poll();
-                if (frame != null) {
-                    try {
-                        sendQueue.put(new Message(MessageType.DATA, frame.frame));
-                    } catch (InterruptedException e) {
-                        System.err.println("Failed to transmit frame: " + e);
-                    }
+
+            // Wait until the channel is free.
+            while (channelBusy) {
+                try {
+                    Thread.sleep(5);
+                } catch (InterruptedException ex) {
+                    return;
                 }
             }
+
+            // Wait a random backoff delay (to stagger simultaneous attempts).
+            long backoffDelay = rand.nextInt(50); // up to 50 ms delay
+            try {
+                Thread.sleep(backoffDelay);
+            } catch (InterruptedException e) {
+                return;
+            }
+
+            // Send an INTENT frame to reserve the channel.
+            sendIntentFrame();
+
+            // Wait a short reservation period (e.g., 20 ms) for the INTENT to propagate.
+            try {
+                Thread.sleep(50);
+            } catch (InterruptedException e) {
+                return;
+            }
+
+            // Check if during that reservation, the channel has been marked busy.
+            // (This can happen if another node also transmitted its INTENT and then claimed the channel.)
+            if (channelBusy) {
+                // Another node seems to be transmitting/reserved; requeue our frame and try later.
+                macTxQueue.offer(frame);
+                continue;
+            }
+
+            // Claim the channel.
+            channelBusy = true;
+            // Inform neighbors by sending a BUSY frame.
+            sendBusyFrame();
+
+            // Transmit the frame.
+            try {
+                sendQueue.put(new Message(MessageType.DATA, frame.frame));
+            } catch (InterruptedException e) {
+                System.err.println("Failed to transmit frame: " + e);
+            }
+
+            // Wait a short period to ensure our transmission completes.
+            try {
+                Thread.sleep(10); // Adjust as appropriate for your channel
+            } catch (InterruptedException e) {
+                return;
+            }
+
+            // Release the channel by sending a FREE frame.
+            sendFreeFrame();
+            // Mark channel as free locally.
+            channelBusy = false;
+        }
+    }
+    // Add this field in your ProtocolLayer class:
+    private Set<String> intentRelayCache = Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    // Utility method to build a unique key for an INTENT frame:
+    private String makeIntentKey(ByteBuffer buf) {
+        // We assume the sender’s address is stored at position 1
+        byte sender = buf.get(1);
+        // For simplicity, use the sender's address plus a timestamp (or a counter) if available.
+        // In a real system, INTENT frames would carry a sequence number.
+        return "INTENT:" + sender;
+    }
+
+    private ByteBuffer buildIntentFrame() {
+        // Build an 8-byte frame that uses FLAG_INTENT. For example:
+        // [0] = FLAG_INTENT, [1] = srcAddr, and the rest can be 0.
+        ByteBuffer buf = ByteBuffer.allocate(HEADER_LEN);
+        buf.put(FLAG_INTENT);
+        buf.put(localAddress); // include our local address as the sender identifier
+        buf.put((byte) 0);      // finalDest not used here—could be zero or BROADCAST_ADDR
+        buf.put(BROADCAST_ADDR); // nextHop set to broadcast, for example.
+        buf.putShort((short) 0); // messageID not relevant for INTENT
+        buf.put((byte) 0);       // fragIndex
+        buf.put((byte) 1);       // totalFrags, fixed to 1
+        buf.flip();
+        return buf;
+    }
+
+    private void sendIntentFrame() {
+        ByteBuffer buf = buildIntentFrame();
+        try {
+            sendQueue.put(new Message(MessageType.INTENT, buf));
+        } catch (InterruptedException e) {
+            System.err.println("Failed to send INTENT frame: " + e);
         }
     }
 
+    private void sendBusyFrame() {
+        ByteBuffer buf = ByteBuffer.allocate(1);
+        buf.put((byte) 0x02); // BUSY (already used in your protocol)
+        buf.flip();
+        try {
+            sendQueue.put(new Message(MessageType.BUSY, buf));
+        } catch (InterruptedException e) {
+            System.err.println("Failed to send BUSY frame: " + e);
+        }
+    }
+
+    private void sendFreeFrame() {
+        ByteBuffer buf = ByteBuffer.allocate(1);
+        buf.put((byte) 0x01); // FREE
+        buf.flip();
+        try {
+            sendQueue.put(new Message(MessageType.FREE, buf));
+        } catch (InterruptedException e) {
+            System.err.println("Failed to send FREE frame: " + e);
+        }
+    }
     // ============ HELLO and Neighbor Cleanup ============
     private void helloLoop() {
         try {
