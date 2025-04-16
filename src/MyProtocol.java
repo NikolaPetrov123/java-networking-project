@@ -66,10 +66,10 @@ public class MyProtocol {
                 System.out.println("Exiting...");
                 System.exit(0);
             } else if (line.equalsIgnoreCase("/list")) {
-                Set<Byte> neighs = layer.getNeighbors();
-                System.out.println("Neighbors: " + neighs);
                 System.out.println("My Address: " + layer.getLocalAddress());
-            } else if (line.startsWith("/whisper ")) {
+                System.out.println("Routing Table (reachable nodes):");
+                System.out.println(layer.getRoutingTableString());
+            }else if (line.startsWith("/whisper ")) {
                 String[] parts = line.split(" ", 3);
                 if (parts.length < 3) {
                     System.out.println("Usage: /whisper <destAddr> <message>");

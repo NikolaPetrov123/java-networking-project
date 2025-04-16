@@ -777,6 +777,26 @@ public class ProtocolLayer {
         }
     }
 
+    /**
+     * Returns a string representing the current routing table.
+     * Each entry is formatted as "Node X, nexthop = Y, distance = Z".
+     * The entries are sorted by the destination node for consistency.
+     */
+    public String getRoutingTableString() {
+        StringBuilder sb = new StringBuilder();
+        List<Byte> keys = new ArrayList<>(routingTable.keySet());
+        // Sort keys numerically for easy reading
+        Collections.sort(keys, Comparator.comparingInt(b -> b));
+        for (Byte dest : keys) {
+            RouteInfo info = routingTable.get(dest);
+            sb.append("Node ").append(dest)
+                    .append(", nexthop = ").append(info.nextHop)
+                    .append(", distance = ").append(info.distance)
+                    .append("\n");
+        }
+        return sb.toString();
+    }
+
     // ============ Utility: Build Frame Header (8 bytes) ============
     /*
        [0] controlFlags
