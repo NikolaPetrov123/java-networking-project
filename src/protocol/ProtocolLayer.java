@@ -58,7 +58,7 @@ public class ProtocolLayer {
 
     // Neighbors (directly connected nodes): maps neighbor address to last-heard time in ms.
     private ConcurrentHashMap<Byte, Long> neighbors = new ConcurrentHashMap<>();
-    private static final long NEIGHBOR_TIMEOUT_MS = 30000;
+    private static final long NEIGHBOR_TIMEOUT_MS = 60000;
 
     // Fragment reassembly storage.
     private Map<String, MessageFragmentBuffer> reassemblyMap = new ConcurrentHashMap<>();
@@ -324,7 +324,7 @@ public class ProtocolLayer {
                             intentRelayCache.add(intentKey);
                             // Optionally, delay slightly to allow the INTENT to propagate naturally
                             try {
-                                Thread.sleep(10);
+                                Thread.sleep(1000);
                             } catch (InterruptedException e) {
                                 // Ignore interruption for the relay delay
                             }
@@ -590,7 +590,7 @@ public class ProtocolLayer {
             }
 
             // Wait a random backoff delay (to stagger simultaneous attempts).
-            long backoffDelay = rand.nextInt(50); // up to 50 ms delay
+            long backoffDelay = rand.nextInt(200); // up to 50 ms delay
             try {
                 Thread.sleep(backoffDelay);
             } catch (InterruptedException e) {
@@ -602,7 +602,7 @@ public class ProtocolLayer {
 
             // Wait a short reservation period (e.g., 20 ms) for the INTENT to propagate.
             try {
-                Thread.sleep(50);
+                Thread.sleep(100);
             } catch (InterruptedException e) {
                 return;
             }
@@ -629,7 +629,7 @@ public class ProtocolLayer {
 
             // Wait a short period to ensure our transmission completes.
             try {
-                Thread.sleep(10); // Adjust as appropriate for your channel
+                Thread.sleep(200); // Adjust as appropriate for your channel
             } catch (InterruptedException e) {
                 return;
             }
@@ -705,7 +705,7 @@ public class ProtocolLayer {
                     sendHello();
                 }
                 cleanupOldNeighbors();
-                Thread.sleep(5000);
+                Thread.sleep(25000);
             }
         } catch (InterruptedException e) {
             // exit thread
