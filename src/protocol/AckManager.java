@@ -21,7 +21,6 @@ public class AckManager {
      * Generate a consistent key for the awaiting sender:
      * We store the localAddress in place of "srcAddr" if we want an ACK for that node's message.
      *
-     * Example usage: ackKey = makeAckKey(localAddr, msgID, fragIdx)
      */
     public String makeAckKey(byte srcAddr, short messageID, byte fragmentIndex) {
         return srcAddr + ":" + messageID + ":" + fragmentIndex;

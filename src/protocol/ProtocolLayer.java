@@ -14,14 +14,11 @@ import java.util.Map;
 /**
  * ProtocolLayer with:
  *  1) Dynamic Addressing,
- *  2) Improved MAC using Slotted ALOHA,
+ *  2) MAC layer using CSMA/CA
  *  3) Stop‐and‐Wait reliability (fragmentation + ACK),
  *  4) Distance Vector routing for multi‐hop unicast forwarding, and
  *  5) An 8‐byte header (carrying both the final destination and link‐layer next hop).
  *
- * In this version, updateRoute() checks the current route for a destination and,
- * if the new distance and nextHop are the same as already stored, no update is performed
- * and no log message is printed.
  */
 public class ProtocolLayer {
 
@@ -45,7 +42,6 @@ public class ProtocolLayer {
     // When a static address is provided (nonzero), dynamic addressing is skipped.
     private volatile boolean isAddressAssigned = false;
 
-    // ============ Fields ============
     private volatile byte localAddress;
     private BlockingQueue<Message> recvQueue;   // From Client.Listener.
     private BlockingQueue<Message> sendQueue;   // To Client.Sender.
@@ -80,7 +76,7 @@ public class ProtocolLayer {
     private byte localConflictCandidate = 0;
     private static final int ADDR_ASSIGN_TIMEOUT_MS = 3000;
 
-    // ============ Distance Vector Routing ============
+    // Distance Vector Routing
     private static final int INFINITY = 999;
     // Routing table: destination -> (distance, nextHop)
     private Map<Byte, RouteInfo> routingTable = new ConcurrentHashMap<>();
@@ -95,7 +91,7 @@ public class ProtocolLayer {
         }
     }
 
-    // ============ MacFrame Class ============
+    // MacFrame Class
     private static class MacFrame {
         ByteBuffer frame;
         public MacFrame(ByteBuffer frame) {
@@ -103,7 +99,6 @@ public class ProtocolLayer {
         }
     }
 
-    // ============ Constructor ============
     public ProtocolLayer(byte initialAddress,
                          BlockingQueue<Message> recvQueue,
                          BlockingQueue<Message> sendQueue,
@@ -119,7 +114,6 @@ public class ProtocolLayer {
         }
     }
 
-    // ============ Lifecycle Methods ============
     public void start() {
         new Thread(this::receiveLoop, "Protocol-ReceiveLoop").start();
         new Thread(this::macLoop, "Protocol-MacLoop").start();
@@ -134,7 +128,6 @@ public class ProtocolLayer {
         return localAddress;
     }
 
-    // ============ Public Chat API ============
     public void sendChatMessage(String message, byte finalDest) {
         if (!isAddressAssigned) {
             System.out.println("Address not assigned yet, cannot send messages.");
@@ -149,11 +142,8 @@ public class ProtocolLayer {
         }, "StopAndWaitSender").start();
     }
 
-    public Set<Byte> getNeighbors() {
-        return Collections.unmodifiableSet(neighbors.keySet());
-    }
 
-    // ============ Dynamic Addressing ============
+    // Dynamic Addressing
     private void addressAssignmentLoop() {
         Random rand = new Random();
         while (!isAddressAssigned) {
@@ -212,7 +202,7 @@ public class ProtocolLayer {
         macTxQueue.offer(new MacFrame(buf));
     }
 
-    // ============ Distance Vector Routing ============
+    // Distance Vector Routing
     private void dvLoop() {
         try {
             while (true) {
@@ -301,7 +291,6 @@ public class ProtocolLayer {
                                    + ": dist=" + dist + ", nextHop=" + nextHop);
     }
 
-    // ============ Receiving Loop ============
     private void receiveLoop() {
         while (true) {
             try {
@@ -322,7 +311,6 @@ public class ProtocolLayer {
                         // If we haven't already relayed this INTENT, do so.
                         if (!intentRelayCache.contains(intentKey)) {
                             intentRelayCache.add(intentKey);
-                            // Optionally, delay slightly to allow the INTENT to propagate naturally
                             try {
                                 Thread.sleep(1000);
                             } catch (InterruptedException e) {
@@ -399,7 +387,6 @@ public class ProtocolLayer {
         }
     }
 
-    // ============ Normal Data Handling (Unicast/Broadcast) ============
     private void handleNormalData(byte controlFlags, byte srcAddr, byte finalDest, byte nextHop,
                                   short messageID, byte fragIndex, byte totalFrags,
                                   byte[] payload) {
@@ -472,11 +459,9 @@ public class ProtocolLayer {
         return ri.nextHop;
     }
 
-    // Add this helper method to ProtocolLayer:
     private String decodeMessage(byte[] data) {
         // Determine the effective length by scanning backwards from the end.
         int end = data.length;
-        // Define a method to decide whether a byte is "printable enough"
         while (end > 0) {
             byte b = data[end - 1];
             // Consider b as padding if it is zero or a whitespace (space, tab) or any control code (except newline or carriage return)
@@ -489,7 +474,6 @@ public class ProtocolLayer {
         }
         return new String(data, 0, end, StandardCharsets.UTF_8);
     }
-    // Update reassembleAndDeliver to use decodeMessage() instead of directly converting the byte array.
     private void reassembleAndDeliver(byte srcAddr, short messageID,
                                       byte fragIndex, byte totalFrags, byte[] payload) {
         String mapKey = srcAddr + ":" + messageID;
@@ -502,8 +486,7 @@ public class ProtocolLayer {
         if (buf.isComplete()) {
             byte[] fullData = buf.reassemble();
             String msgText = decodeMessage(fullData);
-            // For broadcast messages, if the node that sent the message is the local node,
-            // do not call the callback to print the message.
+
             if (srcAddr != localAddress) {
                 if (callback != null) {
                     callback.onReceivedChatMessage("Node " + srcAddr, msgText);
@@ -512,7 +495,7 @@ public class ProtocolLayer {
             reassemblyMap.remove(mapKey);
         }
     }
-    // ============ ACK Handling ============
+
     private void handleAckFrame(byte srcAddr, byte finalDest, byte nextHop,
                                 short messageID, byte fragIndex) {
         if (nextHop != localAddress) return;
@@ -537,7 +520,6 @@ public class ProtocolLayer {
         macTxQueue.offer(new MacFrame(buf));
     }
 
-    // ============ Stop-and-Wait Send ============
     private void stopAndWaitSend(String message, byte finalDest) throws InterruptedException {
         byte[] dataBytes = message.getBytes(StandardCharsets.UTF_8);
         short msgID = (short)new Random().nextInt(Short.MAX_VALUE);
@@ -588,7 +570,6 @@ public class ProtocolLayer {
         }
     }
 
-    // ============ MAC Loop ============
     private void macLoop() {
         Random rand = new Random();
         while (true) {
@@ -611,7 +592,7 @@ public class ProtocolLayer {
             }
 
             // Wait a random backoff delay (to stagger simultaneous attempts).
-            long backoffDelay = rand.nextInt(200); // up to 50 ms delay
+            long backoffDelay = rand.nextInt(200);
             try {
                 Thread.sleep(backoffDelay);
             } catch (InterruptedException e) {
@@ -621,7 +602,7 @@ public class ProtocolLayer {
             // Send an INTENT frame to reserve the channel.
             sendIntentFrame();
 
-            // Wait a short reservation period (e.g., 20 ms) for the INTENT to propagate.
+            // Wait a short reservation period for the INTENT to propagate.
             try {
                 Thread.sleep(100);
             } catch (InterruptedException e) {
@@ -629,9 +610,8 @@ public class ProtocolLayer {
             }
 
             // Check if during that reservation, the channel has been marked busy.
-            // (This can happen if another node also transmitted its INTENT and then claimed the channel.)
             if (channelBusy) {
-                // Another node seems to be transmitting/reserved; requeue our frame and try later.
+                // Another node seems to be transmitting/reserved; requeue the frame and try later.
                 macTxQueue.offer(frame);
                 continue;
             }
@@ -648,9 +628,9 @@ public class ProtocolLayer {
                 System.err.println("Failed to transmit frame: " + e);
             }
 
-            // Wait a short period to ensure our transmission completes.
+            // Wait a short period to ensure the transmission completes.
             try {
-                Thread.sleep(200); // Adjust as appropriate for your channel
+                Thread.sleep(200);
             } catch (InterruptedException e) {
                 return;
             }
@@ -661,26 +641,21 @@ public class ProtocolLayer {
             channelBusy = false;
         }
     }
-    // Add this field in your ProtocolLayer class:
     private Set<String> intentRelayCache = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
     // Utility method to build a unique key for an INTENT frame:
     private String makeIntentKey(ByteBuffer buf) {
         // We assume the sender’s address is stored at position 1
         byte sender = buf.get(1);
-        // For simplicity, use the sender's address plus a timestamp (or a counter) if available.
-        // In a real system, INTENT frames would carry a sequence number.
         return "INTENT:" + sender;
     }
 
     private ByteBuffer buildIntentFrame() {
-        // Build an 8-byte frame that uses FLAG_INTENT. For example:
-        // [0] = FLAG_INTENT, [1] = srcAddr, and the rest can be 0.
         ByteBuffer buf = ByteBuffer.allocate(HEADER_LEN);
         buf.put(FLAG_INTENT);
         buf.put(localAddress); // include our local address as the sender identifier
         buf.put((byte) 0);      // finalDest not used here—could be zero or BROADCAST_ADDR
-        buf.put(BROADCAST_ADDR); // nextHop set to broadcast, for example.
+        buf.put(BROADCAST_ADDR); // nextHop set to broadcast
         buf.putShort((short) 0); // messageID not relevant for INTENT
         buf.put((byte) 0);       // fragIndex
         buf.put((byte) 1);       // totalFrags, fixed to 1
@@ -699,7 +674,7 @@ public class ProtocolLayer {
 
     private void sendBusyFrame() {
         ByteBuffer buf = ByteBuffer.allocate(1);
-        buf.put((byte) 0x02); // BUSY (already used in your protocol)
+        buf.put((byte) 0x02); // BUSY
         buf.flip();
         try {
             sendQueue.put(new Message(MessageType.BUSY, buf));
@@ -718,7 +693,7 @@ public class ProtocolLayer {
             System.err.println("Failed to send FREE frame: " + e);
         }
     }
-    // ============ HELLO and Neighbor Cleanup ============
+
     private void helloLoop() {
         try {
             while (true) {
@@ -762,7 +737,6 @@ public class ProtocolLayer {
         }
     }
 
-    // ============ Address Conflict Handling ============
     private void handleAddrClaim(byte srcAddr, byte[] payload) {
         if (payload.length < 1) return;
         byte claimed = payload[0];
@@ -818,7 +792,7 @@ public class ProtocolLayer {
         return sb.toString();
     }
 
-    // ============ Utility: Build Frame Header (8 bytes) ============
+    // Utility: Build Frame Header (8 bytes)
     /*
        [0] controlFlags
        [1] srcAddr
