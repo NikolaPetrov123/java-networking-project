@@ -472,6 +472,24 @@ public class ProtocolLayer {
         return ri.nextHop;
     }
 
+    // Add this helper method to ProtocolLayer:
+    private String decodeMessage(byte[] data) {
+        // Determine the effective length by scanning backwards from the end.
+        int end = data.length;
+        // Define a method to decide whether a byte is "printable enough"
+        while (end > 0) {
+            byte b = data[end - 1];
+            // Consider b as padding if it is zero or a whitespace (space, tab) or any control code (except newline or carriage return)
+            if (b == 0 || b == ' ' || b == '\t' ||
+                    ((b < 32) && (b != '\n' && b != '\r'))) {
+                end--;
+            } else {
+                break;
+            }
+        }
+        return new String(data, 0, end, StandardCharsets.UTF_8);
+    }
+    // Update reassembleAndDeliver to use decodeMessage() instead of directly converting the byte array.
     private void reassembleAndDeliver(byte srcAddr, short messageID,
                                       byte fragIndex, byte totalFrags, byte[] payload) {
         String mapKey = srcAddr + ":" + messageID;
@@ -483,14 +501,17 @@ public class ProtocolLayer {
         buf.addFragment(fragIndex, payload);
         if (buf.isComplete()) {
             byte[] fullData = buf.reassemble();
-            String msgText = new String(fullData, StandardCharsets.UTF_8);
-            if (callback != null) {
-                callback.onReceivedChatMessage("Node " + srcAddr, msgText);
+            String msgText = decodeMessage(fullData);
+            // For broadcast messages, if the node that sent the message is the local node,
+            // do not call the callback to print the message.
+            if (srcAddr != localAddress) {
+                if (callback != null) {
+                    callback.onReceivedChatMessage("Node " + srcAddr, msgText);
+                }
             }
             reassemblyMap.remove(mapKey);
         }
     }
-
     // ============ ACK Handling ============
     private void handleAckFrame(byte srcAddr, byte finalDest, byte nextHop,
                                 short messageID, byte fragIndex) {
